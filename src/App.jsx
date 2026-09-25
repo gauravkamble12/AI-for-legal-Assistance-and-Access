@@ -1,8 +1,9 @@
 import React, { useState, useCallback } from 'react';
-import { FileText, Scale, FileSearch, ShieldAlert, FileQuestion, BookOpen, Clock, Settings, Upload, CheckCircle, Download, Send } from 'lucide-react';
-import ReactMarkdown from 'react-markdown';
+import { FileText, Scale, BookOpen, Clock, Upload, Download, Send } from 'lucide-react';
 import { analyzeDocument } from './gemini';
 import * as pdfjsLib from 'pdfjs-dist';
+import ActionCards from './components/ActionCards';
+import ChatWindow from './components/ChatWindow';
 import './index.css';
 
 // Configure PDF.js worker securely and efficiently
@@ -218,29 +219,7 @@ function App() {
 
             <div className="analysis-pane" style={{ display: 'flex', flexDirection: 'column' }} aria-label="AI Analysis Panel">
               {!selectedAction && chatHistory.length === 0 && (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '16px', background: 'rgba(255,255,255,0.05)', borderRadius: '12px' }} role="status">
-                    <CheckCircle color="#2ed573" aria-hidden="true" />
-                    <div>
-                      <strong>Document Loaded Successfully</strong>
-                      <div style={{ fontSize: '12px', color: '#8b9db8' }}>Choose an AI task below or just ask a question!</div>
-                    </div>
-                  </div>
-                  
-                  <h3>What would you like to do?</h3>
-                  <div className="action-cards" role="menu">
-                    <button className="action-card" onClick={() => executeAction('simplify')} role="menuitem">
-                      <FileSearch size={24} color="#4da4ff" aria-hidden="true" />
-                      <h3>Simplify Document</h3>
-                      <p>Translate complex legalese into plain language.</p>
-                    </button>
-                    <button className="action-card" onClick={() => executeAction('risks')} role="menuitem">
-                      <ShieldAlert size={24} color="#ff4757" aria-hidden="true" />
-                      <h3>Extract Risks & Clauses</h3>
-                      <p>Identify hidden obligations and high-risk terms.</p>
-                    </button>
-                  </div>
-                </div>
+                <ActionCards onAction={executeAction} />
               )}
 
               {(selectedAction || chatHistory.length > 0) && (
@@ -256,43 +235,24 @@ function App() {
                       </button>
                     </div>
                   </div>
-                  
-                  <div className="result-area" style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '16px' }} role="log" aria-live="polite">
-                    {analysisResult && (
-                      <div className="animate-fade-in" style={{ paddingBottom: '24px', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
-                        <ReactMarkdown>{analysisResult}</ReactMarkdown>
-                      </div>
-                    )}
 
-                    {chatHistory.map((msg, idx) => (
-                      <div key={idx} className={`chat-bubble ${msg.role}`}>
-                        {msg.role === 'ai' ? <ReactMarkdown>{msg.content}</ReactMarkdown> : msg.content}
-                      </div>
-                    ))}
-
-                    {isLoading && (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '16px' }} aria-busy="true">
-                        <div className="loader" aria-hidden="true"></div>
-                        <span style={{ color: '#8b9db8' }}>Thinking...</span>
-                      </div>
-                    )}
-                    
-                    {error && (
-                      <div role="alert" style={{ color: '#ff4757', padding: '16px', background: 'rgba(255, 71, 87, 0.1)', borderRadius: '8px' }}>
-                        <strong>Error:</strong> {error}
-                      </div>
-                    )}
-                  </div>
+                  <ChatWindow
+                    analysisResult={analysisResult}
+                    chatHistory={chatHistory}
+                    isLoading={isLoading}
+                    error={error}
+                  />
 
                   <div style={{ display: 'flex', gap: '12px', marginTop: '16px', flexShrink: 0 }}>
-                    <input 
-                      type="text" 
+                    <input
+                      type="text"
                       style={{ flex: 1, padding: '12px 16px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)', background: 'rgba(0,0,0,0.3)', color: '#fff', fontSize: '14px', outline: 'none' }}
-                      placeholder="Ask a question about this document..." 
+                      placeholder="Ask a question about this document..."
                       value={chatInput}
                       onChange={(e) => setChatInput(e.target.value)}
                       onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
                       aria-label="Chat input field"
+                      maxLength={2000}
                     />
                     <button className="button-primary" onClick={handleSendMessage} disabled={isLoading || !chatInput.trim()} aria-label="Send message">
                       <Send size={16} aria-hidden="true" />
