@@ -1,48 +1,77 @@
-/**
- * Input Sanitization Utility
- * Prevents prompt injection and XSS attacks.
- */
+export const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024;
+export const MAX_DOCUMENT_CHARS = 100_000;
+export const MAX_QUESTION_CHARS = 2_000;
+export const MAX_RESPONSE_CHARS = 60_000;
+export const MAX_CHAT_MESSAGES = 20;
+export const MAX_CHAT_CONTEXT_MESSAGES = 8;
+export const MAX_CHAT_CONTEXT_MESSAGE_CHARS = 6_000;
 
-// Max characters sent to the LLM per request for security & cost control
-const MAX_INPUT_LENGTH = 50000;
+const ALLOWED_TYPES = {
+  '.txt': new Set(['', 'text/plain', 'application/octet-stream']),
+  '.md': new Set(['', 'text/plain', 'text/markdown', 'application/octet-stream']),
+  '.pdf': new Set(['', 'application/pdf', 'application/octet-stream']),
+};
 
-// Simple rate limiting: max 10 requests per minute in the client
 const RATE_LIMIT_MAX = 10;
-const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
-
+const RATE_LIMIT_WINDOW_MS = 60_000;
 const requestLog = [];
 
-/**
- * Sanitizes user-provided text to prevent prompt injection attacks.
- * Strips known injection patterns and enforces a max length.
- * @param {string} text - Raw user input
- * @returns {string} - Sanitized text
- */
-export const sanitizeInput = (text) => {
+export const normalizeText = (text) => {
   if (typeof text !== 'string') return '';
 
-  return text
-    .slice(0, MAX_INPUT_LENGTH) // Enforce length limit
-    // eslint-disable-next-line no-control-regex
-    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '') // Strip non-printable control chars
-    .replace(/(ignore (previous|above|all) instructions?)/gi, '[REDACTED]') // Block prompt injection
-    .replace(/(system prompt|you are now|forget everything)/gi, '[REDACTED]')
+  const printable = Array.from(text.normalize('NFKC'), (character) => {
+    const code = character.charCodeAt(0);
+    return code === 9 || code === 10 || (code >= 32 && code !== 127) ? character : '';
+  }).join('');
+
+  return printable
+    .replace(/\r\n?/g, '\n')
+    .replace(/\n{4,}/g, '\n\n\n')
     .trim();
 };
 
-/**
- * Checks if the current user has exceeded the rate limit.
- * @returns {boolean} - true if allowed, false if rate limited
- */
+export const validateFile = (file) => {
+  if (!file || typeof file.name !== 'string' || !Number.isFinite(file.size)) {
+    return { valid: false, error: 'No valid file was selected.' };
+  }
+
+  const name = file.name.trim();
+  const extensionIndex = name.lastIndexOf('.');
+  const extension = extensionIndex > 0 ? name.slice(extensionIndex).toLowerCase() : '';
+  const allowedTypes = ALLOWED_TYPES[extension];
+
+  if (!allowedTypes) {
+    return { valid: false, error: 'Unsupported file type. Choose a .txt, .md, or .pdf file.' };
+  }
+
+  if (file.size === 0) {
+    return { valid: false, error: 'The selected file is empty.' };
+  }
+
+  if (file.size > MAX_FILE_SIZE_BYTES) {
+    const size = (file.size / 1024 / 1024).toFixed(2);
+    return { valid: false, error: `The selected file is ${size} MB. The maximum size is 5 MB.` };
+  }
+
+  const mimeType = typeof file.type === 'string' ? file.type.toLowerCase().split(';')[0] : '';
+  if (!allowedTypes.has(mimeType)) {
+    return { valid: false, error: 'The file content type does not match its extension.' };
+  }
+
+  return { valid: true, error: null };
+};
+
 export const checkRateLimit = () => {
   const now = Date.now();
-  // Remove entries older than the window
-  while (requestLog.length > 0 && now - requestLog[0] > RATE_LIMIT_WINDOW_MS) {
+  while (requestLog.length > 0 && now - requestLog[0] >= RATE_LIMIT_WINDOW_MS) {
     requestLog.shift();
   }
-  if (requestLog.length >= RATE_LIMIT_MAX) {
-    return false; // Rate limited
-  }
+
+  if (requestLog.length >= RATE_LIMIT_MAX) return false;
   requestLog.push(now);
   return true;
+};
+
+export const resetRateLimit = () => {
+  requestLog.length = 0;
 };

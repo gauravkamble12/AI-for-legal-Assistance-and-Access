@@ -1,85 +1,136 @@
-import { sanitizeInput, checkRateLimit } from './utils/security';
+import {
+  MAX_CHAT_CONTEXT_MESSAGE_CHARS,
+  MAX_CHAT_CONTEXT_MESSAGES,
+  MAX_DOCUMENT_CHARS,
+  MAX_QUESTION_CHARS,
+  MAX_RESPONSE_CHARS,
+  checkRateLimit,
+  normalizeText,
+} from './utils/security';
 
-/**
- * Sends a legal document to the Google Gemini API for analysis.
- * @param {string} apiKey - The Gemini API Key (from env variables)
- * @param {string} documentText - The raw document text
- * @param {string} task - One of: simplify | risks | questions | chat
- * @param {string} userQuestion - Only used when task is 'chat'
- * @returns {Promise<string>} - Markdown-formatted AI response
- */
-export const analyzeDocument = async (apiKey, documentText, task, userQuestion = "") => {
-  if (!apiKey) {
-    throw new Error("API Key is missing.");
+const VALID_TASKS = new Set(['simplify', 'risks', 'questions', 'chat']);
+const REQUEST_TIMEOUT_MS = 35_000;
+
+export class AnalysisError extends Error {
+  constructor(message, status = 500, retryAfter = null) {
+    super(message);
+    this.name = 'AnalysisError';
+    this.status = status;
+    this.retryAfter = retryAfter;
+  }
+}
+
+const getStatusMessage = (status) => {
+  if (status === 400) return 'The request could not be processed.';
+  if (status === 403) return 'The analysis request was blocked.';
+  if (status === 413) return 'This document is too large to analyze.';
+  if (status === 429) return 'The service is busy. Please wait before trying again.';
+  if (status === 503) return 'Analysis is temporarily unavailable. Please try again later.';
+  return 'Analysis failed. Please try again.';
+};
+
+const parseResponse = async (response) => {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+};
+
+export const analyzeDocument = async ({
+  documentText,
+  task,
+  question = '',
+  history = [],
+  signal,
+}) => {
+  const normalizedDocument = normalizeText(documentText);
+  const normalizedQuestion = normalizeText(question);
+
+  if (!VALID_TASKS.has(task)) {
+    throw new AnalysisError('Choose a valid analysis task.', 400);
   }
 
-  // Security: Rate limit check
+  if (!normalizedDocument) {
+    throw new AnalysisError('The document does not contain readable text.', 400);
+  }
+
+  if (normalizedDocument.length > MAX_DOCUMENT_CHARS) {
+    throw new AnalysisError('The document is too large to analyze.', 413);
+  }
+
+  if (task === 'chat' && !normalizedQuestion) {
+    throw new AnalysisError('Enter a question about the document.', 400);
+  }
+
+  if (normalizedQuestion.length > MAX_QUESTION_CHARS) {
+    throw new AnalysisError('The question is too long.', 413);
+  }
+
+  if (signal?.aborted) {
+    throw new DOMException('The request was cancelled.', 'AbortError');
+  }
+
+  const boundedHistory = (Array.isArray(history) ? history : [])
+    .slice(-MAX_CHAT_CONTEXT_MESSAGES)
+    .flatMap((message) => {
+      if (!message || typeof message !== 'object') return [];
+      const role = message.role === 'user' ? 'user' : ['assistant', 'ai'].includes(message.role) ? 'assistant' : null;
+      const content = normalizeText(message.content).slice(0, MAX_CHAT_CONTEXT_MESSAGE_CHARS);
+      return role && content ? [{ role, content }] : [];
+    });
+
   if (!checkRateLimit()) {
-    throw new Error("Too many requests. Please wait a moment before trying again.");
+    throw new AnalysisError('Too many requests. Please wait a moment and try again.', 429, 60);
   }
 
-  // Security: Sanitize all inputs before sending to LLM
-  const safeDocument = sanitizeInput(documentText);
-  const safeQuestion = sanitizeInput(userQuestion);
+  const controller = new AbortController();
+  const abortFromCaller = () => controller.abort(signal.reason);
+  let timedOut = false;
 
-  if (!safeDocument) {
-    throw new Error("Document content is empty or invalid.");
-  }
+  if (signal?.aborted) abortFromCaller();
+  signal?.addEventListener('abort', abortFromCaller, { once: true });
 
-  let prompt = "";
-
-  if (task === 'simplify') {
-    prompt = `You are a legal‑information assistant. Rewrite the document below in plain language at Grade 8 reading level. Keep all key conditions, obligations, and exceptions intact. Add 1 realistic example. Use this structure:
-- Simple explanation:
-- Example:
-- Unclear or risky parts (if any):
-
-Document:
-${safeDocument}`;
-
-  } else if (task === 'risks') {
-    prompt = `You are a legal‑information assistant. Identify and extract important clauses and risks (e.g. Termination, Auto-renewal, Payment, Confidentiality, IP, Non-compete). For each, provide a plain-language meaning and risk level (Low/Medium/High with a reason). Format as a bullet list.
-
-Document:
-${safeDocument}`;
-
-  } else if (task === 'questions') {
-    prompt = `You are a legal‑information assistant. Generate 6–10 specific, practical questions for the user to ask a qualified lawyer about this document. Prioritize high-risk clauses and unclear terms.
-
-Document:
-${safeDocument}`;
-
-  } else if (task === 'chat') {
-    prompt = `You are a legal‑information assistant. Answer the user's question based ONLY on the provided legal document. If the answer is not in the document, say "I cannot find this in the provided document." Do not invent facts. End with "Note: This is general information, not legal advice."
-
-Document:
-${safeDocument}
-
-User Question:
-${safeQuestion}`;
-  }
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, REQUEST_TIMEOUT_MS);
 
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-        }),
-      }
-    );
+    const response = await fetch('/api/analyze', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        documentText: normalizedDocument,
+        task,
+        question: normalizedQuestion,
+        history: boundedHistory,
+      }),
+      signal: controller.signal,
+    });
+
+    const payload = await parseResponse(response);
 
     if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(errorData.error?.message || "Failed to analyze document.");
+      const retryAfter = Number(response.headers.get('retry-after')) || payload?.retryAfter || null;
+      const message = typeof payload?.error === 'string' ? payload.error : getStatusMessage(response.status);
+      throw new AnalysisError(message, response.status, retryAfter);
     }
 
-    const data = await response.json();
-    return data.candidates[0].content.parts[0].text;
+    const text = typeof payload?.text === 'string' ? payload.text.trim() : '';
+    if (!text) {
+      throw new AnalysisError('The service returned an empty response. Please try again.', 502);
+    }
+
+    return text.slice(0, MAX_RESPONSE_CHARS);
   } catch (error) {
-    console.error("Gemini API Error:", error);
-    throw error;
+    if (error instanceof AnalysisError) throw error;
+    if (signal?.aborted) throw error;
+    if (timedOut) throw new AnalysisError('The request timed out. Please try again.', 408);
+    throw new AnalysisError('Unable to reach the analysis service. Check your connection and try again.', 503);
+  } finally {
+    clearTimeout(timeoutId);
+    signal?.removeEventListener('abort', abortFromCaller);
   }
 };

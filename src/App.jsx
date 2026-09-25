@@ -1,186 +1,424 @@
-import React, { useState, useCallback } from 'react';
-import { FileText, Scale, BookOpen, Clock, Upload, Download, Send } from 'lucide-react';
+import React, { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { BookOpen, Clock, Download, FileText, Scale, Send, Upload } from 'lucide-react';
 import { analyzeDocument } from './gemini';
-import { saveToHistory } from './utils/history';
-import * as pdfjsLib from 'pdfjs-dist';
 import ActionCards from './components/ActionCards';
 import ChatWindow from './components/ChatWindow';
 import History from './components/History';
 import LegalGlossary from './components/LegalGlossary';
-import './index.css';
+import { extractTextFromFile } from './utils/documents';
+import {
+  createSessionId,
+  getHistoryEnabled,
+  saveSession,
+  setHistoryEnabled,
+} from './utils/history';
+import {
+  MAX_CHAT_MESSAGES,
+  MAX_QUESTION_CHARS,
+  normalizeText,
+  validateFile,
+} from './utils/security';
 
-// Configure PDF.js worker securely and efficiently
-pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
+const SAMPLE_CONTRACT = `EMPLOYMENT AGREEMENT
+
+1. POSITION AND DUTIES
+The Employer agrees to employ the Employee as Software Engineer.
+
+2. COMPENSATION
+The Employee will be paid a base salary of $100,000 per year.
+
+3. NON-COMPETE
+During the term of employment and for a period of 2 years thereafter, the Employee shall not engage in any business that competes with the Employer within a 100-mile radius.
+
+4. TERMINATION
+This Agreement may be terminated by either party with 30 days written notice.`;
+
+const ACTION_LABELS = {
+  simplify: 'Plain-language summary',
+  risks: 'Risk and clause analysis',
+  questions: 'Lawyer question checklist',
+  chat: 'Document Q&A',
+};
+
+const getErrorMessage = (error) => {
+  if (error?.name === 'AbortError') return '';
+  return error instanceof Error && error.message
+    ? error.message
+    : 'Something went wrong. Please try again.';
+};
+
+const sanitizeReportName = (fileName) => {
+  const withoutExtension = normalizeText(fileName.replace(/\.[^.]+$/, ''));
+  const safeName = Array.from(withoutExtension, (character) => (
+    '<>:"/\\|?*'.includes(character) ? '_' : character
+  )).join('').replace(/\s+/g, ' ').trim().slice(0, 100);
+  return safeName || 'Document';
+};
+
+const DocumentPane = memo(({ fileName, documentContent }) => (
+  <div className="document-pane">
+    <div className="pane-header">
+      <FileText size={16} aria-hidden="true" />
+      <span title={fileName}>{fileName}</span>
+    </div>
+    <section
+      className="document-content"
+      tabIndex={0}
+      aria-label="Uploaded document text"
+    >
+      {documentContent}
+    </section>
+  </div>
+));
+
+DocumentPane.displayName = 'DocumentPane';
 
 function App() {
   const [activeTab, setActiveTab] = useState('upload');
   const [hasFile, setHasFile] = useState(false);
   const [fileName, setFileName] = useState('');
   const [documentContent, setDocumentContent] = useState('');
-  
+  const [sessionId, setSessionId] = useState('');
   const [selectedAction, setSelectedAction] = useState(null);
   const [analysisResult, setAnalysisResult] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState(null);
-  
+  const [operation, setOperation] = useState(null);
+  const [uploadProgress, setUploadProgress] = useState(null);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [chatInput, setChatInput] = useState('');
   const [chatHistory, setChatHistory] = useState([]);
-  
-  const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
+  const [historyEnabled, setHistoryPreference] = useState(getHistoryEnabled);
+  const [isDragging, setIsDragging] = useState(false);
 
-  const handleFileUpload = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
+  const fileInputRef = useRef(null);
+  const requestControllerRef = useRef(null);
+  const uploadControllerRef = useRef(null);
+  const sessionVersionRef = useRef(0);
+  const historyEnabledRef = useRef(historyEnabled);
 
-    setFileName(file.name);
-    setIsLoading(true);
-    setError(null);
+  useEffect(() => {
+    historyEnabledRef.current = historyEnabled;
+  }, [historyEnabled]);
 
-    if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
-      const reader = new FileReader();
-      reader.onload = async (event) => {
-        try {
-          const typedarray = new Uint8Array(event.target.result);
-          const pdf = await pdfjsLib.getDocument(typedarray).promise;
-          let fullText = '';
-          for (let i = 1; i <= pdf.numPages; i++) {
-            const page = await pdf.getPage(i);
-            const textContent = await page.getTextContent();
-            const pageText = textContent.items.map(item => item.str).join(' ');
-            fullText += `--- Page ${i} ---\n${pageText}\n\n`;
-          }
-          setDocumentContent(fullText);
-          setHasFile(true);
-          setActiveTab('actions');
-        } catch {
-          setError('Failed to extract text from the PDF.');
-        } finally {
-          setIsLoading(false);
-        }
-      };
-      reader.readAsArrayBuffer(file);
-    } else {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        setDocumentContent(event.target.result);
-        setHasFile(true);
-        setActiveTab('actions');
-        setIsLoading(false);
-      };
-      reader.readAsText(file);
-    }
-  };
+  const isLoading = operation !== null;
+  const canExport = Boolean(analysisResult || chatHistory.length > 0);
 
-  const loadSampleContract = () => {
-    const sample = `EMPLOYMENT AGREEMENT\n\n1. POSITION AND DUTIES\nThe Employer agrees to employ the Employee as Software Engineer.\n\n2. COMPENSATION\nThe Employee will be paid a base salary of $100,000 per year.\n\n3. NON-COMPETE\nDuring the term of employment and for a period of 2 years thereafter, the Employee shall not engage in any business that competes with the Employer within a 100-mile radius.\n\n4. TERMINATION\nThis Agreement may be terminated by either party with 30 days written notice.`;
-    setFileName('Sample_Contract.txt');
-    setDocumentContent(sample);
-    setHasFile(true);
-    setActiveTab('actions');
-  };
+  const abortActiveWork = useCallback(() => {
+    sessionVersionRef.current += 1;
+    requestControllerRef.current?.abort();
+    uploadControllerRef.current?.abort();
+    requestControllerRef.current = null;
+    uploadControllerRef.current = null;
+  }, []);
 
-  const executeAction = useCallback(async (action) => {
-    setSelectedAction(action);
-    setIsLoading(true);
-    setAnalysisResult('');
-    setError(null);
-    setChatHistory([]);
+  useEffect(() => () => {
+    sessionVersionRef.current += 1;
+    requestControllerRef.current?.abort();
+    uploadControllerRef.current?.abort();
+  }, []);
 
-    try {
-      if (!apiKey) throw new Error("API Key missing in environment variables.");
-      const result = await analyzeDocument(apiKey, documentContent, action);
-      setAnalysisResult(result);
-      // Save to history
-      saveToHistory(fileName, action, result);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setIsLoading(false);
-    }
-  }, [apiKey, documentContent, fileName]);
-
-  const handleSendMessage = useCallback(async () => {
-    if (!chatInput.trim()) return;
-    const userMsg = chatInput;
-    setChatInput('');
-    setChatHistory(prev => [...prev, { role: 'user', content: userMsg }]);
-    setIsLoading(true);
-
-    try {
-      if (!apiKey) throw new Error("API Key missing in environment variables.");
-      const result = await analyzeDocument(apiKey, documentContent, 'chat', userMsg);
-      setChatHistory(prev => [...prev, { role: 'ai', content: result }]);
-      saveToHistory(fileName, 'chat', result);
-    } catch (err) {
-      setChatHistory(prev => [...prev, { role: 'ai', content: `Error: ${err.message}` }]);
-    } finally {
-      setIsLoading(false);
-    }
-  }, [apiKey, documentContent, chatInput, fileName]);
-
-  const downloadReport = useCallback(() => {
-    if (!analysisResult && chatHistory.length === 0) return;
-    let contentToSave = `# LexAssist AI Report for ${fileName}\n\n`;
-    if (analysisResult) contentToSave += `## Analysis (${selectedAction})\n\n${analysisResult}\n\n`;
-    if (chatHistory.length > 0) {
-      contentToSave += `## Q&A Session\n\n`;
-      chatHistory.forEach(msg => {
-        contentToSave += `**${msg.role === 'user' ? 'You' : 'AI'}:**\n${msg.content}\n\n`;
-      });
-    }
-    const blob = new Blob([contentToSave], { type: 'text/markdown' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `LexAssist_Report_${fileName}.md`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }, [analysisResult, chatHistory, fileName, selectedAction]);
-
-  const clearSession = () => {
-    setHasFile(false);
-    setDocumentContent('');
+  const clearAnalysis = useCallback(() => {
     setSelectedAction(null);
     setAnalysisResult('');
     setChatHistory([]);
-    setActiveTab('upload');
+    setChatInput('');
+    setError('');
+    setNotice('');
+  }, []);
+
+  const clearSession = useCallback(() => {
+    abortActiveWork();
+    setHasFile(false);
     setFileName('');
-    setError(null);
+    setDocumentContent('');
+    setSessionId('');
+    setOperation(null);
+    setUploadProgress(null);
+    setIsDragging(false);
+    clearAnalysis();
+    setActiveTab('upload');
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  }, [abortActiveWork, clearAnalysis]);
+
+  const handleNewAnalysis = () => {
+    if (hasFile && !window.confirm('Start a new analysis and clear the current document?')) return;
+    clearSession();
   };
 
-  const loadHistorySession = (entry) => {
-    setFileName(entry.fileName);
-    setDocumentContent(entry.result);
-    setSelectedAction(entry.action);
-    setAnalysisResult(entry.result);
-    setHasFile(false);
+  const handleClearSession = () => {
+    if (hasFile && !window.confirm('Clear the current document and its results?')) return;
+    clearSession();
+  };
+
+  const processFile = useCallback(async (file) => {
+    if (!file) return;
+
+    const validation = validateFile(file);
+    if (!validation.valid) {
+      setError(validation.error);
+      setNotice('');
+      return;
+    }
+
+    abortActiveWork();
+    const version = sessionVersionRef.current;
+    const controller = new AbortController();
+    uploadControllerRef.current = controller;
+    setOperation('upload');
+    setUploadProgress(null);
+    setError('');
+    setNotice('');
+
+    try {
+      const content = await extractTextFromFile(file, {
+        signal: controller.signal,
+        onProgress: (progress) => {
+          if (version === sessionVersionRef.current) setUploadProgress(progress);
+        },
+      });
+
+      if (version !== sessionVersionRef.current) return;
+      setFileName(file.name);
+      setDocumentContent(content);
+      setSessionId(createSessionId());
+      setHasFile(true);
+      setSelectedAction(null);
+      setAnalysisResult('');
+      setChatHistory([]);
+      setChatInput('');
+      setActiveTab('actions');
+    } catch (uploadError) {
+      if (version !== sessionVersionRef.current || uploadError?.name === 'AbortError') return;
+      setError(getErrorMessage(uploadError));
+    } finally {
+      if (version === sessionVersionRef.current && uploadControllerRef.current === controller) {
+        uploadControllerRef.current = null;
+        setOperation(null);
+        setUploadProgress(null);
+      }
+    }
+  }, [abortActiveWork]);
+
+  const handleFileChange = (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    processFile(file);
+  };
+
+  const handleDrop = (event) => {
+    event.preventDefault();
+    setIsDragging(false);
+    const files = Array.from(event.dataTransfer.files || []);
+    if (files.length !== 1) {
+      setError('Drop one document at a time.');
+      return;
+    }
+    processFile(files[0]);
+  };
+
+  const loadSampleContract = () => {
+    abortActiveWork();
+    clearAnalysis();
+    setFileName('Sample_Contract.txt');
+    setDocumentContent(SAMPLE_CONTRACT);
+    setSessionId(createSessionId());
+    setHasFile(true);
+    setOperation(null);
+    setUploadProgress(null);
     setActiveTab('actions');
   };
 
-  // Render sidebar-only views
-  const renderSidebarView = () => {
-    if (activeTab === 'history') return <History onLoadSession={loadHistorySession} />;
-    if (activeTab === 'glossary') return <LegalGlossary />;
-    return null;
+  const persistSession = useCallback((action, result, messages) => {
+    if (!historyEnabledRef.current) return;
+
+    const saved = saveSession({
+      id: sessionId,
+      fileName,
+      documentContent,
+      action,
+      analysisResult: result,
+      chatHistory: messages,
+      createdAt: new Date().toISOString(),
+    });
+
+    setNotice(saved.ok ? 'Session saved on this device.' : saved.error);
+  }, [documentContent, fileName, sessionId]);
+
+  const executeAction = useCallback(async (action) => {
+    if (isLoading || requestControllerRef.current || !documentContent || !ACTION_LABELS[action] || action === 'chat') return;
+
+    const version = sessionVersionRef.current;
+    const controller = new AbortController();
+    requestControllerRef.current = controller;
+    setSelectedAction(action);
+    setAnalysisResult('');
+    setChatHistory([]);
+    setChatInput('');
+    setOperation('analysis');
+    setError('');
+    setNotice('');
+
+    try {
+      const result = await analyzeDocument({
+        documentText: documentContent,
+        task: action,
+        signal: controller.signal,
+      });
+
+      if (version !== sessionVersionRef.current) return;
+      setAnalysisResult(result);
+      persistSession(action, result, []);
+    } catch (requestError) {
+      if (version !== sessionVersionRef.current || requestError?.name === 'AbortError') return;
+      setError(getErrorMessage(requestError));
+    } finally {
+      if (version === sessionVersionRef.current && requestControllerRef.current === controller) {
+        requestControllerRef.current = null;
+        setOperation(null);
+      }
+    }
+  }, [documentContent, isLoading, persistSession]);
+
+  const openChat = useCallback(() => {
+    if (isLoading || requestControllerRef.current) return;
+    setSelectedAction('chat');
+    setAnalysisResult('');
+    setChatHistory([]);
+    setChatInput('');
+    setError('');
+    setNotice('');
+  }, [isLoading]);
+
+  const handleSendMessage = useCallback(async () => {
+    const content = normalizeText(chatInput);
+    if (isLoading || requestControllerRef.current || !documentContent || !content || content.length > MAX_QUESTION_CHARS) return;
+
+    const previousMessages = chatHistory.slice(-MAX_CHAT_MESSAGES);
+    const userMessage = { id: createSessionId(), role: 'user', content };
+    const version = sessionVersionRef.current;
+    const controller = new AbortController();
+    requestControllerRef.current = controller;
+    setChatHistory([...previousMessages, userMessage]);
+    setChatInput('');
+    setOperation('chat');
+    setError('');
+    setNotice('');
+
+    try {
+      const result = await analyzeDocument({
+        documentText: documentContent,
+        task: 'chat',
+        question: content,
+        history: previousMessages.map(({ role, content: messageContent }) => ({
+          role: role === 'user' ? 'user' : 'assistant',
+          content: messageContent,
+        })),
+        signal: controller.signal,
+      });
+
+      if (version !== sessionVersionRef.current) return;
+      const nextMessages = [
+        ...previousMessages,
+        userMessage,
+        { id: createSessionId(), role: 'ai', content: result },
+      ];
+      setChatHistory(nextMessages);
+      persistSession(selectedAction || 'chat', analysisResult, nextMessages);
+    } catch (requestError) {
+      if (version !== sessionVersionRef.current || requestError?.name === 'AbortError') return;
+      setChatHistory(previousMessages);
+      setChatInput(content);
+      setError(getErrorMessage(requestError));
+    } finally {
+      if (version === sessionVersionRef.current && requestControllerRef.current === controller) {
+        requestControllerRef.current = null;
+        setOperation(null);
+      }
+    }
+  }, [analysisResult, chatHistory, chatInput, documentContent, isLoading, persistSession, selectedAction]);
+
+  const downloadReport = useCallback(() => {
+    if (!canExport) return;
+
+    let report = `# LexAssist AI Report for ${fileName}\n\n`;
+    report += '> General information only; this is not legal advice.\n\n';
+    if (analysisResult) {
+      report += `## ${ACTION_LABELS[selectedAction] || 'Analysis'}\n\n${analysisResult}\n\n`;
+    }
+    if (chatHistory.length > 0) {
+      report += '## Document Q&A\n\n';
+      for (const message of chatHistory) {
+        report += `**${message.role === 'user' ? 'You' : 'LexAssist'}:**\n${message.content}\n\n`;
+      }
+    }
+
+    const blob = new Blob([report], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `LexAssist_${sanitizeReportName(fileName)}.md`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }, [analysisResult, canExport, chatHistory, fileName, selectedAction]);
+
+  const loadHistorySession = (entry) => {
+    abortActiveWork();
+    setFileName(entry.fileName);
+    setDocumentContent(entry.documentContent);
+    setSessionId(entry.id);
+    setSelectedAction(entry.action);
+    setAnalysisResult(entry.analysisResult);
+    setChatHistory(entry.chatHistory);
+    setHasFile(true);
+    setOperation(null);
+    setUploadProgress(null);
+    setError('');
+    setNotice('Loaded a session saved on this device.');
+    historyEnabledRef.current = true;
+    setHistoryPreference(true);
+    setActiveTab('actions');
+  };
+
+  const handleHistoryPreference = (enabled) => {
+    const saved = setHistoryEnabled(enabled);
+    historyEnabledRef.current = saved ? enabled : false;
+    setHistoryPreference(historyEnabledRef.current);
+    setNotice(saved
+      ? enabled
+        ? 'New sessions will be saved on this device.'
+        : 'New sessions will no longer be saved. Existing history remains until cleared.'
+      : 'Browser storage is unavailable.');
   };
 
   const isSidebarView = activeTab === 'history' || activeTab === 'glossary';
 
   return (
-    <div className="app-container" aria-label="Application Container">
-      <aside className="sidebar" aria-label="Main Navigation Sidebar">
-        <div className="sidebar-logo" role="heading" aria-level="1">
-          <Scale size={28} color="#b15dff" aria-hidden="true" />
+    <div className="app-container">
+      <aside className="sidebar">
+        <div className="sidebar-logo">
+          <Scale size={28} aria-hidden="true" />
           LexAssist AI
         </div>
 
-        <nav className="sidebar-nav" aria-label="Primary Navigation">
+        <nav className="sidebar-nav" aria-label="Primary navigation">
+          {hasFile && (
+            <button
+              className={`nav-item ${activeTab === 'actions' ? 'active' : ''}`}
+              onClick={() => setActiveTab('actions')}
+              aria-current={activeTab === 'actions' ? 'page' : undefined}
+            >
+              <FileText size={20} aria-hidden="true" />
+              Current Document
+            </button>
+          )}
           <button
-            className={`nav-item ${activeTab === 'upload' || activeTab === 'actions' ? 'active' : ''}`}
-            onClick={() => { setActiveTab(hasFile ? 'actions' : 'upload'); }}
-            aria-current={activeTab === 'upload' || activeTab === 'actions' ? 'page' : undefined}
+            className={`nav-item ${activeTab === 'upload' ? 'active' : ''}`}
+            onClick={handleNewAnalysis}
+            aria-current={activeTab === 'upload' ? 'page' : undefined}
           >
-            <FileText size={20} aria-hidden="true" />
+            <Upload size={20} aria-hidden="true" />
             New Analysis
           </button>
           <button
@@ -200,86 +438,156 @@ function App() {
             Legal Glossary
           </button>
         </nav>
+
+        <p className="sidebar-disclaimer">General legal information, not legal advice.</p>
       </aside>
 
-      <main className="main-content" role="main">
-        {/* Sidebar Views (History / Glossary) */}
-        {isSidebarView && renderSidebarView()}
+      <main className="main-content">
+        {isSidebarView && (
+          <section className="sidebar-view">
+            {activeTab === 'history'
+              ? <History onLoadSession={loadHistorySession} />
+              : <LegalGlossary />}
+          </section>
+        )}
 
-        {/* Main Analysis View */}
         {!isSidebarView && (
           <>
             <header className="header">
               <div>
-                <h2 id="main-heading">Welcome to LexAssist AI</h2>
-                <p>Your intelligent legal document navigator. Understand, compare, and analyze with confidence.</p>
+                <h1>Legal document analysis</h1>
+                <p>Understand key terms, identify risks, and prepare focused questions.</p>
               </div>
-              <div style={{ display: 'flex', gap: '16px', alignItems: 'center' }}>
-                {hasFile && (
-                  <button className="button-secondary" onClick={clearSession} aria-label="Clear current document">
-                    Clear Document
-                  </button>
-                )}
-              </div>
+              {hasFile && (
+                <button className="button-secondary" onClick={handleClearSession}>
+                  Clear Document
+                </button>
+              )}
             </header>
 
             {!hasFile && (
-              <section className="animate-fade-in" style={{ display: 'flex', flexDirection: 'column', gap: '24px', alignItems: 'center', marginTop: '24px' }}>
-                <label className="file-upload-zone" style={{ display: 'flex', width: '100%', maxWidth: '600px', boxSizing: 'border-box' }}>
+              <section className="upload-section animate-fade-in" aria-labelledby="upload-heading">
+                <div
+                  className={`file-upload-zone ${isDragging ? 'dragging' : ''}`}
+                  onDragEnter={(event) => {
+                    event.preventDefault();
+                    setIsDragging(true);
+                  }}
+                  onDragOver={(event) => event.preventDefault()}
+                  onDragLeave={(event) => {
+                    if (!event.currentTarget.contains(event.relatedTarget)) setIsDragging(false);
+                  }}
+                  onDrop={handleDrop}
+                  aria-busy={operation === 'upload'}
+                >
                   <input
+                    ref={fileInputRef}
+                    className="visually-hidden"
                     type="file"
-                    accept=".txt,.md,.pdf"
-                    style={{ display: 'none' }}
-                    onChange={handleFileUpload}
-                    aria-label="Upload legal document file"
+                    accept=".txt,.md,.pdf,text/plain,text/markdown,application/pdf"
+                    onChange={handleFileChange}
+                    tabIndex={-1}
+                    aria-hidden="true"
                   />
                   <Upload className="file-icon" aria-hidden="true" />
-                  <h3>Upload Legal Document</h3>
-                  <p>Select your contract or policy. Supported formats: .txt, .pdf</p>
-                  <span className="button-primary" role="button" tabIndex="0">
-                    {isLoading ? <span className="loader" aria-label="Loading..."></span> : "Browse Files"}
+                  <h2 id="upload-heading">Upload a legal document</h2>
+                  <p>Drag and drop a PDF, TXT, or Markdown file up to 5 MB. PDFs must contain selectable text.</p>
+                  <button
+                    className="button-primary"
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                  >
+                    {operation === 'upload' ? <span className="loader" aria-hidden="true" /> : 'Browse Files'}
+                  </button>
+                  {operation === 'upload' && uploadProgress && (
+                    <output className="upload-status">
+                      Reading page {uploadProgress.current} of {uploadProgress.total}
+                    </output>
+                  )}
+                </div>
+
+                {error && <div className="alert alert-error" role="alert">{error}</div>}
+                {notice && <output className="alert alert-notice">{notice}</output>}
+
+                <label className="history-toggle">
+                  <input
+                    type="checkbox"
+                    aria-label="Save sessions on this device"
+                    checked={historyEnabled}
+                    onChange={(event) => handleHistoryPreference(event.target.checked)}
+                  />
+                  <span>
+                    <strong>Save sessions on this device</strong>
+                    <small>Off by default. Saved documents are not encrypted and remain in browser storage until cleared.</small>
                   </span>
                 </label>
 
-                {error && <div role="alert" style={{ color: '#ff4757' }}>{error}</div>}
+                <div className="or-divider"><span>or</span></div>
 
-                <div style={{ color: '#8b9db8' }}>— OR —</div>
-
-                <button className="button-secondary" onClick={loadSampleContract}>
-                  Load Sample Contract (Quick Test)
+                <button className="button-secondary" type="button" onClick={loadSampleContract}>
+                  Load Sample Contract
                 </button>
+
+                <p className="privacy-note">
+                  Document text and questions are sent to Google Gemini for processing. Do not upload confidential or privileged information.
+                </p>
               </section>
             )}
 
             {hasFile && (
-              <section className="workspace animate-fade-in" aria-label="Analysis Workspace">
-                <div className="document-pane" aria-label="Document Viewer">
-                  <div className="pane-header">
-                    <FileText size={16} aria-hidden="true" /> {fileName}
-                  </div>
-                  <div className="document-content" tabIndex="0">
-                    {documentContent}
-                  </div>
-                </div>
+              <section className="workspace animate-fade-in" aria-label="Analysis workspace">
+                <DocumentPane fileName={fileName} documentContent={documentContent} />
 
-                <div className="analysis-pane" style={{ display: 'flex', flexDirection: 'column' }} aria-label="AI Analysis Panel">
-                  {!selectedAction && chatHistory.length === 0 && (
-                    <ActionCards onAction={executeAction} />
+                <section
+                  className="analysis-pane"
+                  tabIndex={0}
+                  aria-label="Analysis controls and results"
+                >
+                  {notice && <output className="alert alert-notice workspace-notice">{notice}</output>}
+
+                  <label className="history-toggle workspace-history-toggle">
+                    <input
+                      type="checkbox"
+                      aria-label="Save sessions on this device"
+                      checked={historyEnabled}
+                      onChange={(event) => handleHistoryPreference(event.target.checked)}
+                    />
+                    <span>
+                      <strong>Save sessions on this device</strong>
+                      <small>Includes document text. Storage is not encrypted until history is cleared.</small>
+                    </span>
+                  </label>
+
+                  {!selectedAction && (
+                    <ActionCards onAction={executeAction} onChat={openChat} />
                   )}
 
-                  {(selectedAction || chatHistory.length > 0) && (
-                    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', flex: 1, overflow: 'hidden' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', flexShrink: 0 }}>
-                        <h3 style={{ margin: 0 }}>{selectedAction ? 'AI Analysis' : 'Document Q&A'}</h3>
-                        <div style={{ display: 'flex', gap: '8px' }}>
-                          <button className="button-secondary" onClick={downloadReport} aria-label="Download Report as Markdown">
+                  {selectedAction && (
+                    <div className="analysis-workspace">
+                      <div className="analysis-toolbar">
+                        <h2>{analysisResult ? `${ACTION_LABELS[selectedAction]} & Q&A` : ACTION_LABELS[selectedAction]}</h2>
+                        <div className="toolbar-actions">
+                          <button
+                            className="button-secondary compact-button"
+                            onClick={downloadReport}
+                            disabled={!canExport || isLoading}
+                            aria-label="Download report as Markdown"
+                          >
                             <Download size={16} aria-hidden="true" /> Export
                           </button>
-                          <button className="button-secondary" onClick={() => { setSelectedAction(null); setChatHistory([]); }} aria-label="Go back to actions">
-                            &larr; Back
+                          <button
+                            className="button-secondary compact-button"
+                            onClick={clearAnalysis}
+                            disabled={isLoading}
+                          >
+                            Back
                           </button>
                         </div>
                       </div>
+
+                      {selectedAction === 'chat' && !analysisResult && !chatHistory.length && (
+                        <p className="chat-empty">Ask a question about the uploaded document.</p>
+                      )}
 
                       <ChatWindow
                         analysisResult={analysisResult}
@@ -288,24 +596,36 @@ function App() {
                         error={error}
                       />
 
-                      <div style={{ display: 'flex', gap: '12px', marginTop: '16px', flexShrink: 0 }}>
+                      <form
+                        className="chat-form"
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          handleSendMessage();
+                        }}
+                      >
+                        <label className="visually-hidden" htmlFor="document-question">Ask a question about this document</label>
                         <input
+                          id="document-question"
                           type="text"
-                          style={{ flex: 1, padding: '12px 16px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)', background: 'rgba(0,0,0,0.3)', color: '#fff', fontSize: '14px', outline: 'none' }}
                           placeholder="Ask a question about this document..."
                           value={chatInput}
-                          onChange={(e) => setChatInput(e.target.value)}
-                          onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
-                          aria-label="Chat input field"
-                          maxLength={2000}
+                          onChange={(event) => setChatInput(event.target.value)}
+                          maxLength={MAX_QUESTION_CHARS}
+                          disabled={isLoading}
+                          autoComplete="off"
                         />
-                        <button className="button-primary" onClick={handleSendMessage} disabled={isLoading || !chatInput.trim()} aria-label="Send message">
+                        <button
+                          className="button-primary"
+                          type="submit"
+                          disabled={isLoading || !normalizeText(chatInput)}
+                          aria-label="Send message"
+                        >
                           <Send size={16} aria-hidden="true" />
                         </button>
-                      </div>
+                      </form>
                     </div>
                   )}
-                </div>
+                </section>
               </section>
             )}
           </>

@@ -1,48 +1,64 @@
-import React from 'react';
+import React, { memo } from 'react';
 import ReactMarkdown from 'react-markdown';
 
-/**
- * ChatWindow component - handles the AI result display and chat history.
- * @param {string} analysisResult - The initial AI analysis result (markdown)
- * @param {Array} chatHistory - Array of {role, content} chat messages
- * @param {boolean} isLoading - Whether a request is in progress
- * @param {string|null} error - Error message if any
- */
-const ChatWindow = React.memo(({ analysisResult, chatHistory, isLoading, error }) => (
+const safeUrlTransform = (url) => {
+  if (/^(https?:|mailto:|#)/i.test(url) || /^\/(?!\/)/.test(url)) return url;
+  return '';
+};
+
+const markdownComponents = {
+  a: ({ children, href, title }) => (
+    href
+      ? <a href={href} title={title} target="_blank" rel="noopener noreferrer">{children}</a>
+      : <span>{children}</span>
+  ),
+  img: () => null,
+};
+
+const Markdown = ({ children }) => (
+  <ReactMarkdown
+    skipHtml
+    urlTransform={safeUrlTransform}
+    components={markdownComponents}
+  >
+    {children}
+  </ReactMarkdown>
+);
+
+const ChatWindow = memo(({ analysisResult, chatHistory, isLoading, error }) => (
   <div
     className="result-area"
-    style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '16px' }}
     role="log"
+    tabIndex={0}
     aria-live="polite"
-    aria-label="AI analysis output"
+    aria-label="Analysis and conversation output"
   >
     {analysisResult && (
-      <div
-        className="animate-fade-in"
-        style={{ paddingBottom: '24px', borderBottom: '1px solid rgba(255,255,255,0.1)' }}
-      >
-        <ReactMarkdown>{analysisResult}</ReactMarkdown>
-      </div>
+      <article className="analysis-output animate-fade-in">
+        <span className="message-label">Analysis</span>
+        <Markdown>{analysisResult}</Markdown>
+      </article>
     )}
 
-    {chatHistory.map((msg, idx) => (
-      <div key={idx} className={`chat-bubble ${msg.role}`} aria-label={`${msg.role === 'user' ? 'Your message' : 'AI response'}`}>
-        {msg.role === 'ai' ? <ReactMarkdown>{msg.content}</ReactMarkdown> : msg.content}
-      </div>
+    {chatHistory.map((message) => (
+      <article
+        key={message.id || `${message.role}-${message.content.slice(0, 12)}`}
+        className={`chat-bubble ${message.role}`}
+        aria-label={message.role === 'user' ? 'Your message' : 'LexAssist response'}
+      >
+        <span className="message-label">{message.role === 'user' ? 'You' : 'LexAssist'}</span>
+        {message.role === 'ai' ? <Markdown>{message.content}</Markdown> : <p>{message.content}</p>}
+      </article>
     ))}
 
     {isLoading && (
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '16px' }} aria-busy="true" aria-label="AI is thinking">
-        <div className="loader" aria-hidden="true"></div>
-        <span style={{ color: '#8b9db8' }}>Thinking...</span>
+      <div className="thinking-status" aria-busy="true">
+        <div className="loader" aria-hidden="true" />
+        <span>LexAssist is working...</span>
       </div>
     )}
 
-    {error && (
-      <div role="alert" style={{ color: '#ff4757', padding: '16px', background: 'rgba(255, 71, 87, 0.1)', borderRadius: '8px' }}>
-        <strong>Error:</strong> {error}
-      </div>
-    )}
+    {error && <div className="alert alert-error" role="alert">{error}</div>}
   </div>
 ));
 

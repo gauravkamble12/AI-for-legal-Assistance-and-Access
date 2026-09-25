@@ -1,8 +1,19 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "oxc"],
+  "plugins": ["react", "oxc", "import", "jsx-a11y", "promise", "vitest"],
   "rules": {
+    "jsx-a11y/no-noninteractive-tabindex": "off",
     "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
+    "react/exhaustive-deps": "error",
+    "react/no-danger": "error",
+    "react/no-direct-mutation-state": "error"
+  },
+  "overrides": [
+    {
+      "files": ["src/utils/documents.js"],
+      "rules": {
+        "import/default": "off"
+      }
+    }
+  ]
 }

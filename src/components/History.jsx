@@ -1,21 +1,38 @@
-import React, { useState } from 'react';
-import { Clock, Trash2, FileText } from 'lucide-react';
-import { getHistory, deleteHistoryEntry, clearHistory } from '../utils/history';
+import React, { useEffect, useState } from 'react';
+import { FileText, Trash2 } from 'lucide-react';
+import {
+  HISTORY_UPDATED_EVENT,
+  clearHistory,
+  deleteHistoryEntry,
+  getHistory,
+} from '../utils/history';
 
-const actionLabels = {
-  simplify: '📄 Simplify',
-  risks: '🚨 Risk Analysis',
-  questions: "❓ Lawyer Q's",
-  chat: '💬 Chat',
+const ACTION_LABELS = {
+  simplify: 'Plain-language summary',
+  risks: 'Risk analysis',
+  questions: 'Lawyer questions',
+  chat: 'Document Q&A',
 };
 
 const History = ({ onLoadSession }) => {
-  // Initialize state directly from localStorage to avoid setState-in-effect warning
-  const [history, setHistory] = useState(() => getHistory());
+  const [history, setHistory] = useState(getHistory);
+  const [message, setMessage] = useState('');
+
+  useEffect(() => {
+    const refresh = () => setHistory(getHistory());
+    globalThis.addEventListener?.(HISTORY_UPDATED_EVENT, refresh);
+    globalThis.addEventListener?.('storage', refresh);
+    return () => {
+      globalThis.removeEventListener?.(HISTORY_UPDATED_EVENT, refresh);
+      globalThis.removeEventListener?.('storage', refresh);
+    };
+  }, []);
 
   const handleClearAll = () => {
-    clearHistory();
-    setHistory([]);
+    if (!window.confirm('Delete all sessions saved on this device?')) return;
+    const cleared = clearHistory();
+    setHistory(cleared ? [] : getHistory());
+    setMessage(cleared ? 'All local session history was deleted.' : 'Local history could not be deleted.');
   };
 
   const handleDelete = (id) => {
@@ -24,50 +41,56 @@ const History = ({ onLoadSession }) => {
   };
 
   return (
-    <div className="animate-fade-in" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <h2 style={{ margin: 0 }}>Analysis History</h2>
+    <div className="history-view animate-fade-in">
+      <div className="view-heading">
+        <div>
+          <h1>Analysis History</h1>
+          <p>Up to 10 sessions saved on this device.</p>
+        </div>
         {history.length > 0 && (
-          <button className="button-secondary" onClick={handleClearAll} style={{ fontSize: '13px', padding: '6px 12px' }}>
-            <Trash2 size={14} /> Clear All
+          <button className="button-secondary compact-button" type="button" onClick={handleClearAll}>
+            <Trash2 size={15} aria-hidden="true" /> Clear All
           </button>
         )}
       </div>
-      <p>Your past 20 document analyses are saved here.</p>
+
+      <div className="privacy-note">
+        Local history is unencrypted. Delete it when using a shared or public device.
+      </div>
+      {message && <output className="alert alert-notice">{message}</output>}
 
       {history.length === 0 ? (
-        <div style={{ textAlign: 'center', padding: '48px', color: '#8b9db8', border: '1px dashed rgba(255,255,255,0.1)', borderRadius: '12px' }}>
-          <Clock size={40} style={{ marginBottom: '16px', opacity: 0.4 }} />
-          <p>No history yet. Start by analyzing a document!</p>
+        <div className="empty-state">
+          <FileText size={40} aria-hidden="true" />
+          <h2>No saved sessions</h2>
+          <p>Enable “Save sessions on this device” before uploading a document if you want to restore it later.</p>
         </div>
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+        <div className="history-list">
           {history.map((entry) => (
-            <div key={entry.id} style={{ padding: '16px', background: 'rgba(255,255,255,0.03)', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.07)', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '16px' }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
-                  <FileText size={14} color="#4da4ff" />
-                  <strong style={{ fontSize: '14px' }}>{entry.fileName}</strong>
-                  <span style={{ fontSize: '12px', background: 'rgba(177, 93, 255, 0.15)', color: '#b15dff', padding: '2px 8px', borderRadius: '8px' }}>
-                    {actionLabels[entry.action] || entry.action}
-                  </span>
-                </div>
-                <div style={{ fontSize: '12px', color: '#8b9db8', marginBottom: '8px' }}>{entry.date}</div>
-                <div style={{ fontSize: '13px', color: '#a3b3cc', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical' }}>
-                  {entry.result?.slice(0, 200)}...
+            <article className="history-entry" key={entry.id}>
+              <div className="history-entry-heading">
+                <div>
+                  <strong title={entry.fileName}>{entry.fileName}</strong>
+                  <span className="history-action">{ACTION_LABELS[entry.action] || entry.action}</span>
                 </div>
                 <button
-                  className="button-secondary"
-                  style={{ marginTop: '12px', fontSize: '13px', padding: '6px 14px' }}
-                  onClick={() => onLoadSession(entry)}
+                  className="icon-button"
+                  type="button"
+                  onClick={() => handleDelete(entry.id)}
+                  aria-label={`Delete history entry for ${entry.fileName}`}
                 >
-                  Load Session
+                  <Trash2 size={16} aria-hidden="true" />
                 </button>
               </div>
-              <button onClick={() => handleDelete(entry.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#ff4757', padding: '4px' }} aria-label="Delete entry">
-                <Trash2 size={16} />
+              <time dateTime={entry.createdAt}>
+                {new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(entry.createdAt))}
+              </time>
+              <p>{entry.analysisResult || entry.chatHistory.find((messageItem) => messageItem.role === 'ai')?.content || 'Session saved without an analysis result.'}</p>
+              <button className="button-secondary compact-button" type="button" onClick={() => onLoadSession(entry)}>
+                Load Session
               </button>
-            </div>
+            </article>
           ))}
         </div>
       )}
